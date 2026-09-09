@@ -330,6 +330,12 @@ wl_client_get_credentials(const struct wl_client *client,
 int
 wl_client_get_fd(struct wl_client *client);
 
+/* awl 扩展: 把客户端 fd 源迁移到另一事件循环。
+ * 线程契约: 须在旧 loop 所属线程调用; 新 loop 尚未运行。 */
+int
+wl_client_set_event_loop(struct wl_client *client,
+			 struct wl_event_loop *loop);
+
 void
 wl_client_add_destroy_listener(struct wl_client *client,
 			       struct wl_listener *listener);

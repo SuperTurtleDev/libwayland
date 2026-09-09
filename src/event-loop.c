@@ -192,6 +192,19 @@ wl_event_loop_add_fd(struct wl_event_loop *loop,
 	return add_source(loop, &source->base, mask, data);
 }
 
+/** awl: 查询 source 所属事件循环
+ *
+ * wl_display_flush_clients 据此跳过已迁移到专属事件循环的客户端 ——
+ * 主线程对运行中子 loop 做 fd_update 会与其 epoll 并发。
+ *
+ * \memberof wl_event_source
+ */
+WL_EXPORT struct wl_event_loop *
+wl_event_source_get_loop(struct wl_event_source *source)
+{
+	return source->loop;
+}
+
 /** Update a file descriptor source's event mask
  *
  * \param source The file descriptor event source to update.

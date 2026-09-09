@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -69,6 +70,8 @@ struct wl_connection {
 	struct wl_ring_buffer fds_in, fds_out;
 	int fd;
 	int want_flush;
+	/* awl: 多线程发送支持（输入直通）—— closure 追加与 flush 互斥 */
+	pthread_mutex_t mutex;
 };
 
 static inline size_t
@@ -327,6 +330,12 @@ wl_connection_create(int fd, size_t max_buffer_size)
 
 	connection->fd = fd;
 
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&connection->mutex, &attr);
+	pthread_mutexattr_destroy(&attr);
+
 	return connection;
 }
 
@@ -369,6 +378,7 @@ wl_connection_destroy(struct wl_connection *connection)
 	free(connection->fds_in.data);
 	free(connection->in.data);
 
+	pthread_mutex_destroy(&connection->mutex);
 	free(connection);
 
 	return fd;
@@ -450,9 +460,14 @@ wl_connection_flush(struct wl_connection *connection)
 	int len = 0, count;
 	size_t clen;
 	size_t tail;
+	int ret;
 
-	if (!connection->want_flush)
+	pthread_mutex_lock(&connection->mutex);
+
+	if (!connection->want_flush) {
+		pthread_mutex_unlock(&connection->mutex);
 		return 0;
+	}
 
 	tail = connection->out.tail;
 	while (ring_buffer_size(&connection->out) > 0) {
@@ -493,8 +508,10 @@ wl_connection_flush(struct wl_connection *connection)
 				      MSG_NOSIGNAL | MSG_DONTWAIT);
 		} while (len == -1 && errno == EINTR);
 
-		if (len == -1)
+		if (len == -1) {
+			pthread_mutex_unlock(&connection->mutex);
 			return -1;
+		}
 
 		close_fds(&connection->fds_out, MAX_FDS_OUT);
 
@@ -502,8 +519,10 @@ wl_connection_flush(struct wl_connection *connection)
 	}
 
 	connection->want_flush = 0;
+	ret = connection->out.head - tail;
 
-	return connection->out.head - tail;
+	pthread_mutex_unlock(&connection->mutex);
+	return ret;
 }
 
 uint32_t
@@ -1433,8 +1452,13 @@ wl_closure_send(struct wl_closure *closure, struct wl_connection *connection)
 	uint32_t *buffer;
 	int result;
 
-	if (copy_fds_to_connection(closure, connection))
+	/* awl: fds+数据必须同临界区追加 —— 中途被他人 append/flush 会错位 */
+	pthread_mutex_lock(&connection->mutex);
+
+	if (copy_fds_to_connection(closure, connection)) {
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
+	}
 
 	buffer_size = buffer_size_for_closure(closure);
 	buffer = zalloc(buffer_size * sizeof buffer[0]);
@@ -1455,6 +1479,7 @@ wl_closure_send(struct wl_closure *closure, struct wl_connection *connection)
 	result = wl_connection_write(connection, buffer, size);
 	free(buffer);
 
+	pthread_mutex_unlock(&connection->mutex);
 	return result;
 }
 

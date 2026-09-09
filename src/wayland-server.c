@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>   /* awl: client_list_lock */
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <dlfcn.h>
@@ -99,6 +100,9 @@ struct wl_display {
 	struct wl_list global_list;
 	struct wl_list socket_list;
 	struct wl_list client_list;
+	/* awl: client_list 互斥 —— 客户端销毁发生在其专属事件线程（迁移后）,
+	 * 与主线程 create/遍历并发。递归: destroy_clients 遍历中销毁会重入。 */
+	pthread_mutex_t client_list_lock;
 	struct wl_list protocol_loggers;
 
 	struct wl_priv_signal destroy_signal;
@@ -603,7 +607,9 @@ wl_client_create(struct wl_display *display, int fd)
 	if (bind_display(client, display) < 0)
 		goto err_map;
 
+	pthread_mutex_lock(&display->client_list_lock);
 	wl_list_insert(display->client_list.prev, &client->link);
+	pthread_mutex_unlock(&display->client_list_lock);
 
 	wl_priv_signal_emit(&display->create_client_signal, client);
 
@@ -686,6 +692,27 @@ WL_EXPORT int
 wl_client_get_fd(struct wl_client *client)
 {
 	return wl_connection_get_fd(client->connection);
+}
+
+/** awl: 把客户端 fd 源迁移到另一个事件循环
+ *
+ * 线程契约（调用方保证）:
+ *   - 必须在"旧 loop 所属线程"上调用（source 移除非线程安全）
+ *   - 新 loop 必须尚未运行（add_fd 非线程安全）
+ * 迁移后该客户端全部请求分发在新 loop 线程; wl_client_destroy 亦在
+ * 新线程执行（其 source 属新 loop）。
+ *
+ * \memberof wl_client
+ */
+WL_EXPORT int
+wl_client_set_event_loop(struct wl_client *client, struct wl_event_loop *loop)
+{
+	int fd = wl_connection_get_fd(client->connection);
+
+	wl_event_source_remove(client->source);
+	client->source = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE,
+					      wl_client_connection_data, client);
+	return client->source ? 0 : -1;
 }
 
 /** Look up an object in the client name space
@@ -1004,9 +1031,11 @@ wl_client_destroy(struct wl_client *client)
 		return;
 	}
 
+	pthread_mutex_lock(&client->display->client_list_lock);   /* awl */
 	wl_list_remove(&client->link);
 	/* Keep the client link safe to inspect. */
 	wl_list_init(&client->link);
+	pthread_mutex_unlock(&client->display->client_list_lock);
 
 	wl_priv_signal_final_emit(&client->destroy_signal, client);
 
@@ -1222,6 +1251,13 @@ wl_display_create(void)
 	wl_list_init(&display->global_list);
 	wl_list_init(&display->socket_list);
 	wl_list_init(&display->client_list);
+	{
+		pthread_mutexattr_t attr;
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&display->client_list_lock, &attr);   /* awl */
+		pthread_mutexattr_destroy(&attr);
+	}
 	wl_list_init(&display->registry_resource_list);
 	wl_list_init(&display->protocol_loggers);
 
@@ -1315,6 +1351,8 @@ wl_display_destroy(struct wl_display *display)
 	wl_array_release(&display->additional_shm_formats);
 
 	wl_list_remove(&display->protocol_loggers);
+
+	pthread_mutex_destroy(&display->client_list_lock);   /* awl */
 
 	free(display);
 }
@@ -1550,9 +1588,8 @@ wl_display_get_serial(const struct wl_display *display)
 WL_EXPORT uint32_t
 wl_display_next_serial(struct wl_display *display)
 {
-	display->serial++;
-
-	return display->serial;
+	/* awl: 多线程取 serial（输入直通线程与事件线程并发）—— 原子化 */
+	return __sync_add_and_fetch(&display->serial, 1);
 }
 
 WL_EXPORT struct wl_event_loop *
@@ -1587,6 +1624,10 @@ wl_display_run(struct wl_display *display)
 	}
 }
 
+/* awl: event-loop.c 导出的助手 —— 查询 source 所属 loop */
+struct wl_event_loop *
+wl_event_source_get_loop(struct wl_event_source *source);
+
 WL_EXPORT void
 wl_display_flush_clients(struct wl_display *display)
 {
@@ -1594,7 +1635,20 @@ wl_display_flush_clients(struct wl_display *display)
 	int ret;
 
 	wl_list_for_each_safe(client, next, &display->client_list, link) {
+		pthread_mutex_lock(&display->client_list_lock);   /* awl */
+		if (wl_list_empty(&client->link)) {   /* 并发已销毁 */
+			pthread_mutex_unlock(&display->client_list_lock);
+			continue;
+		}
+		/* awl: 已迁移到专属事件循环的客户端由其 loop 线程管理事件 mask;
+		 * 主线程 fd_update 会与子 loop 的 epoll 并发 —— 跳过
+		 * （其输出由各直发路径的 wl_client_flush 推进） */
+		if (wl_event_source_get_loop(client->source) != display->loop) {
+			pthread_mutex_unlock(&display->client_list_lock);
+			continue;
+		}
 		ret = wl_connection_flush(client->connection);
+		pthread_mutex_unlock(&display->client_list_lock);
 		if (ret < 0 && errno == EAGAIN) {
 			wl_event_source_fd_update(client->source,
 						  WL_EVENT_WRITABLE |
@@ -1624,9 +1678,11 @@ wl_display_destroy_clients(struct wl_display *display)
 
 	/* Move the whole client list to a temporary head because some new clients
 	 * might be added to the original head. */
+	pthread_mutex_lock(&display->client_list_lock);   /* awl */
 	wl_list_init(&tmp_client_list);
 	wl_list_insert_list(&tmp_client_list, &display->client_list);
 	wl_list_init(&display->client_list);
+	pthread_mutex_unlock(&display->client_list_lock);
 
 	/* wl_list_for_each_safe isn't enough here: it fails if the next client is
 	 * destroyed by the destroy handler of the current one. */
