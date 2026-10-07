@@ -1467,12 +1467,14 @@ wl_closure_send(struct wl_closure *closure, struct wl_connection *connection)
 		       "size %d\n for %s (signature %s)",
 		       buffer_size * sizeof buffer[0], closure->message->name,
 		       closure->message->signature);
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
 	}
 
 	size = serialize_closure(closure, buffer, buffer_size);
 	if (size < 0) {
 		free(buffer);
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
 	}
 
@@ -1491,8 +1493,15 @@ wl_closure_queue(struct wl_closure *closure, struct wl_connection *connection)
 	uint32_t *buffer;
 	int result;
 
-	if (copy_fds_to_connection(closure, connection))
+	/* The AWL server may queue resource-destruction events while renderer or
+	 * input threads send and flush events for the same client.  Keep the fd
+	 * and byte rings under the same connection lock as the send path. */
+	pthread_mutex_lock(&connection->mutex);
+
+	if (copy_fds_to_connection(closure, connection)) {
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
+	}
 
 	buffer_size = buffer_size_for_closure(closure);
 	buffer = malloc(buffer_size * sizeof buffer[0]);
@@ -1501,18 +1510,21 @@ wl_closure_queue(struct wl_closure *closure, struct wl_connection *connection)
 		       "size %d\n for %s (signature %s)",
 		       buffer_size * sizeof buffer[0], closure->message->name,
 		       closure->message->signature);
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
 	}
 
 	size = serialize_closure(closure, buffer, buffer_size);
 	if (size < 0) {
 		free(buffer);
+		pthread_mutex_unlock(&connection->mutex);
 		return -1;
 	}
 
 	result = wl_connection_queue(connection, buffer, size);
 	free(buffer);
 
+	pthread_mutex_unlock(&connection->mutex);
 	return result;
 }
 
