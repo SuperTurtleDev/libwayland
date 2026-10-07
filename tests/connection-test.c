@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <pthread.h>
 
 #include "wayland-private.h"
 #include "test-runner.h"
@@ -254,6 +255,158 @@ TEST(connection_marshal)
 	assert(memcmp(&data.buffer[3], text, array.size) == 0);
 
 	release_marshal_data(&data);
+}
+
+#define CONCURRENT_MESSAGES 5000
+
+struct concurrent_connection_data {
+	struct wl_connection *connection;
+	int peer_fd;
+	pthread_barrier_t barrier;
+	uint32_t *received;
+};
+
+struct concurrent_writer_data {
+	struct concurrent_connection_data *shared;
+	struct wl_object sender;
+	uint32_t tag;
+	bool queue;
+};
+
+static int
+marshal_concurrent(struct concurrent_writer_data *writer, uint32_t sequence,
+		   ...)
+{
+	static const struct wl_message message = { "concurrent", "uu", NULL };
+	struct wl_closure *closure;
+	va_list ap;
+	int result;
+
+	va_start(ap, sequence);
+	closure = wl_closure_vmarshal(&writer->sender, 0, ap, &message);
+	va_end(ap);
+	assert(closure);
+
+	if (writer->queue)
+		result = wl_closure_queue(closure, writer->shared->connection);
+	else
+		result = wl_closure_send(closure, writer->shared->connection);
+
+	wl_closure_destroy(closure);
+	return result;
+}
+
+static void *
+concurrent_writer(void *data)
+{
+	struct concurrent_writer_data *writer = data;
+	uint32_t i;
+
+	for (i = 0; i < CONCURRENT_MESSAGES; i++) {
+		int ret = pthread_barrier_wait(&writer->shared->barrier);
+		assert(ret == 0 || ret == PTHREAD_BARRIER_SERIAL_THREAD);
+		assert(marshal_concurrent(writer, i, writer->tag, i) == 0);
+	}
+
+	return NULL;
+}
+
+static void *
+concurrent_reader(void *data)
+{
+	struct concurrent_connection_data *shared = data;
+	const size_t expected = 2 * CONCURRENT_MESSAGES * 4 * sizeof(uint32_t);
+	uint8_t *bytes = (uint8_t *) shared->received;
+	size_t offset = 0;
+
+	while (offset < expected) {
+		struct pollfd pfd = { shared->peer_fd, POLLIN, 0 };
+		ssize_t len;
+
+		assert(poll(&pfd, 1, 5000) == 1);
+		len = read(shared->peer_fd, bytes + offset, expected - offset);
+		assert(len > 0);
+		offset += len;
+	}
+
+	return NULL;
+}
+
+TEST(connection_concurrent_queue_and_send)
+{
+	struct concurrent_connection_data shared;
+	struct concurrent_writer_data writers[2];
+	pthread_t writer_threads[2], reader_thread;
+	bool *seen[2];
+	size_t i;
+	int sockets[2];
+	char empty = 0;
+
+	shared.connection = setup(sockets);
+	shared.peer_fd = sockets[1];
+	shared.received = calloc(2 * CONCURRENT_MESSAGES * 4,
+				 sizeof *shared.received);
+	assert(shared.received);
+	assert(pthread_barrier_init(&shared.barrier, NULL, 2) == 0);
+
+	writers[0] = (struct concurrent_writer_data) {
+		.shared = &shared,
+		.sender = { NULL, NULL, 1001 },
+		.tag = 0,
+		.queue = true,
+	};
+	writers[1] = (struct concurrent_writer_data) {
+		.shared = &shared,
+		.sender = { NULL, NULL, 1002 },
+		.tag = 1,
+		.queue = false,
+	};
+
+	assert(pthread_create(&reader_thread, NULL, concurrent_reader, &shared) == 0);
+	for (i = 0; i < 2; i++)
+		assert(pthread_create(&writer_threads[i], NULL,
+				      concurrent_writer, &writers[i]) == 0);
+	for (i = 0; i < 2; i++)
+		assert(pthread_join(writer_threads[i], NULL) == 0);
+
+	/* A queued event does not itself request a flush, so explicitly mark the
+	 * connection writable after both producers have stopped. */
+	assert(wl_connection_write(shared.connection, &empty, 0) == 0);
+	while (wl_connection_flush(shared.connection) < 0) {
+		struct pollfd pfd = { sockets[0], POLLOUT, 0 };
+		assert(errno == EAGAIN);
+		assert(poll(&pfd, 1, 5000) == 1);
+	}
+	assert(pthread_join(reader_thread, NULL) == 0);
+
+	seen[0] = calloc(CONCURRENT_MESSAGES, sizeof *seen[0]);
+	seen[1] = calloc(CONCURRENT_MESSAGES, sizeof *seen[1]);
+	assert(seen[0] && seen[1]);
+	for (i = 0; i < 2 * CONCURRENT_MESSAGES; i++) {
+		uint32_t *message = &shared.received[i * 4];
+		uint32_t tag = message[2];
+		uint32_t sequence = message[3];
+
+		assert((message[0] == 1001 && tag == 0) ||
+		       (message[0] == 1002 && tag == 1));
+		assert(message[1] == (16 << 16));
+		assert(tag < 2);
+		assert(sequence < CONCURRENT_MESSAGES);
+		assert(!seen[tag][sequence]);
+		seen[tag][sequence] = true;
+	}
+
+	for (i = 0; i < CONCURRENT_MESSAGES; i++) {
+		assert(seen[0][i]);
+		assert(seen[1][i]);
+	}
+
+	free(seen[0]);
+	free(seen[1]);
+	free(shared.received);
+	pthread_barrier_destroy(&shared.barrier);
+	close(wl_connection_destroy(shared.connection));
+	close(shared.peer_fd);
 }
 
 static void
